@@ -1,0 +1,794 @@
+---
+title: 'Stochastic block models and extensions: code for application of London gang
+  network'
+---
+
+This is an [R Markdown] Notebook that can be used to generate the results of Figures 2, 3, 4 and 5 and results within. 
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*.
+
+```{r}
+library(readxl)
+London_gang_stripped <- read_excel("C:/Users/rikak/Desktop/Networks/LondonGang/London_gang_stripped.xlsx", 
+    col_names = FALSE)
+L<-London_gang_stripped
+```
+
+**Assign attributes to variables**
+
+```{r}
+Attr <- read.csv("/LONDON_GANG_ATTR.csv")
+Age  <- Attr[1:54,2]
+Birth <- Attr[1:54,3]
+Residence <- Attr[1:54,4]
+Arrests <- Attr[1:54,5]
+Convictions <- Attr[1:54,6]
+Prison <- Attr[1:54,7]
+Music <- Attr[1:54,8]
+Ranking <- Attr[1:54,9]
+Y<-as.matrix(L)
+```
+
+**Save data, clean workspace**
+
+```{r}
+save(Y, L, Age, Residence, Arrests, Convictions, Prison, Music, Ranking, Birth, file="/data.RData") 
+rm(list=ls())
+``` 
+
+
+**Set working directory, load everything.**
+```{r}
+# load ESBM models of Legramanti(2020)
+source("/esbm.R")
+Rcpp::sourceCpp('/stirling.cpp')
+# load libraries
+library(reshape)
+library(gdata)
+library(igraph)
+library(mcclust.ext) 
+library(RColorBrewer)
+library(pheatmap)
+library(gridExtra)
+library(grid)
+library(cowplot)
+library(ggplot2)
+library(coda)
+library(dummies)
+library(randnet)
+load(file="/data.RData") 
+V <- dim(Y)[1]
+# note that Y must have diagonal equal to 0
+diag(Y)
+``` 
+Setting the hyperparameters
+================
+For the hyperparameters of the `Beta(a,b)` **priors on the block probabilities** we follow common implementations of stochastic block models and consider the default values `a=1` and `b=1` to induce a **uniform** prior. Less straightforward is instead the choice of the hyperparameters for the **Gibbs-type priors on the random partition**. A possibility to address this issue is to specify such quantities in order to obtain a value for the expectation of the non-empty number of clusters `k` that matches some prior knowledge. Below, we provide the **code to obtain such a quantity as a function of pre-specified hyperparameters for the four relevant examples of Gibbs-type priors** such that we know how many clusters they induce. 
+
+```{r}
+
+N_iter <- 50000
+V <- dim(Y)[1]
+my_seed <- 1
+my_z <- c(1:V)
+burn_in <- 10000
+
+# ------------------------------------
+# DIRICHLET MULTINOMIAL
+# ------------------------------------
+sigma_dm <- 0   
+H_dm <- 5 # Conservative upper bound 
+beta_dm <- 12/H_dm 
+round(expected_cl_py(V, sigma = sigma_dm, theta = beta_dm*H_dm, H = H_dm))
+
+# ------------------------------------
+# DIRICHLET PROCESS (CRP)
+# ------------------------------------
+sigma_dp <- 0  
+H_dp <- Inf 
+alpha_dp <- 1.2
+round(expected_cl_py(V, sigma = sigma_dp, theta = alpha_dp, H = H_dp))
+
+# ------------------------------------
+# PITMAN-YOR PROCESS
+# ------------------------------------
+sigma_py <- 0.52
+H_py <- Inf 
+alpha_dp <- -0.350
+round(expected_cl_py(V, sigma = sigma_py, theta = alpha_dp, H = H_py))
+
+# ------------------------------------
+# GNEDIN PROCESS
+# ------------------------------------
+set.seed(1123123)
+gamma <- 0.55
+probs_gnedin <- HGnedin(V, 1:V, gamma = gamma)
+round(sum(1:V*probs_gnedin))
+```
+
+Here we arbitrarily **set the hyperparameters so that the expected number of clusters `k` is 5 under all the four priors**. This value is exactly the number of clusters according to the Louvain algorithm (as we will see), which seems reasonably conservative.
+
+
+Implementation without node-specific attributes
+------------------
+Let us first **perform posterior computation for the model without node attributes: DM, DP, PY, GN [unsup]**. To do this, execute the code below.
+
+```{r}
+N_iter <- 50000
+V <- dim(Y)[1]
+my_seed <- 1
+my_z <- c(1:V)
+
+# ------------------------------------
+# DIRICHLET MULTINOMIAL
+# ------------------------------------
+
+my_prior <- "DM"
+Z_DM <- esbm(Y, my_seed, N_iter, my_prior, my_z, a = 1, b = 1, beta_DM = 12/5, H_DM = 5)
+
+# ------------------------------------
+# DIRICHLET PROCESS (CRP)
+# ------------------------------------
+
+my_prior <- "DP"
+Z_DP <- esbm(Y, my_seed, N_iter, my_prior, my_z, a = 1, b = 1, alpha_PY =1.2, sigma_PY = 0)
+
+# ------------------------------------
+# PITMAN-YOR PROCESS
+# ------------------------------------
+
+my_prior <- "PY"
+Z_PY <- esbm(Y, my_seed, N_iter, my_prior, my_z, a = 1, b = 1, alpha_PY = -0.350, sigma_PY = 0.52)
+
+# ------------------------------------
+# GNEDIN PROCESS: unsupervised
+# ------------------------------------
+
+my_prior  <- "GN"
+Z_GN <- esbm(Y, my_seed, N_iter, my_prior, my_z, a = 1, b = 1, gamma_GN = 0.55)
+```
+
+Once the above steps have been done, **compute the logarithm of the marginal likelihoods** that will be used for comparing the performance of the different prior specifications, and **save the output** in the file `Posterior_No_Attributes.RData`.
+
+```{r}
+# compute the logarithm of the marginal likelihoods under the different priors
+
+l_y_DM <- rep(0,N_iter)
+for (t in 1:N_iter){
+  l_y_DM[t] <- log_pY_z(Y,Z_DM[,t],1,1)
+  if (t%%1000 == 0){print(paste("Iteration:", t))}
+}
+
+l_y_DP <- rep(0,N_iter)
+for (t in 1:N_iter){
+  l_y_DP[t] <- log_pY_z(Y,Z_DP[,t],1,1)
+  if (t%%1000 == 0){print(paste("Iteration:", t))}
+}
+
+l_y_PY <- rep(0,N_iter)
+for (t in 1:N_iter){
+  l_y_PY[t] <- log_pY_z(Y,Z_PY[,t],1,1)
+  if (t%%1000 == 0){print(paste("Iteration:", t))}
+}
+
+l_y_GN <- rep(0,N_iter)
+for (t in 1:N_iter){
+  l_y_GN[t] <- log_pY_z(Y,Z_GN[,t],1,1)
+  if (t%%1000 == 0){print(paste("Iteration:", t))}
+}
+
+# Save the output
+save(Z_DP,l_y_DP,Z_PY,l_y_PY,Z_GN,l_y_GN,Z_DM,l_y_DM,file="C:/Users/rikak/Desktop/Networks/Code_notebooks/noattributes_posterior.Rdata")
+rm(Z_DP,l_y_DP,Z_PY,l_y_PY,Z_GN,l_y_GN,Z_DM,l_y_DM)
+```
+
+
+We now compute the **posterior with node specific attributes: GN[sup]**. Specifically, we incorporate knowledge about the birth locations of the gang members.
+
+```{r}
+N_iter  <- 50000
+V <- dim(Y)[1]
+my_seed <- 1
+my_z <- c(1:V)
+
+# define the vector with node attributes
+my_x <- c(as.factor(Birth))
+
+my_alpha_xi <- rep(1,4)
+my_prior <- "GN"
+
+set.seed(123123)
+Z_GN_x <- esbm(Y, my_seed, N_iter, my_prior, my_z, a = 1, b = 1, gamma_GN = 0.68, x = my_x, alpha_xi = my_alpha_xi)
+``` 
+And the **logarithm of marginal likelihood of GN[sup]** and save it. 
+
+```{r}
+# compute the logarithm of the marginal likelihood under supervised GN prior
+
+l_y_GN_x <- rep(0,N_iter)
+for (t in 1:N_iter){
+  l_y_GN_x[t] <- log_pY_z(Y,Z_GN_x[,t],1,1)
+  if (t%%1000 == 0){print(paste("Iteration:", t))}
+}
+
+# save the output
+save(Z_GN_x,l_y_GN_x,file="/withattributes_posterior.Rdata")
+rm(Z_GN_x,l_y_GN_x)
+```
+
+
+Posterior inference under ESBM [Table 1]
+================
+This section contains the **code to perform estimation, uncertainty quantification and model selection for ESBM** leveraging the samples from the collapsed Gibbs sampler. In particular, we **reproduce the analyses in Table 1 of the article**. To accomplish this goal let us first load the posterior via **importing the MCMC samples** and define the `burn_in`. 
+
+
+```{r}
+
+load("/withattributes_posterior.Rdata")
+load("/noattributes_posterior.Rdata")
+load("/data.RData")
+
+N_iter <- 50000
+V <- dim(Y)[1]
+my_seed <- 1
+my_z <- c(1:V)
+burn_in <- 10000
+
+``` 
+
+
+Before performing posterior inference, let us **visualize the traceplots for the logarithm of the likelihood in Eq. [3]**, evaluated at the MCMC samples of `z` under the different priors, both with and without nodal attributes.
+
+```{r}
+traceplot <- melt(cbind(l_y_DM,l_y_DP,l_y_PY,l_y_GN,l_y_GN_x))
+traceplot <- traceplot[,-2]
+traceplot$Group <- c(rep("DM",N_iter),rep("DP",N_iter),rep("PY",N_iter),rep("GN [unsup]",N_iter),rep("GN [sup]",N_iter))
+traceplot$Group <- factor(traceplot$Group,levels=c("DM","DP","PY","GN [unsup]","GN [sup]"))
+Trace <- ggplot(traceplot,aes(y=value,x=X1)) + geom_line() + facet_grid(.~Group) + theme_bw() + labs(y="",x="")
+Trace
+save(traceplot,file="")
+``` 
+
+The above traceplots confirm that our Gibbs sampler has **satisfactory mixing and convergence**. Due to the stability of the chains for the quantity in Eq. [3], we can reliably compute the **logarithm of the marginal likelihoods** for the different priors and models via the harmonic mean in Eq. [5] (*see the first column in Table 1*).
+```{r}
+
+
+N_iter <- 50000
+V <- dim(Y)[1]
+my_seed <- 1
+my_z <- c(1:V)
+burn_in <- 10000
+
+# ------------------------------------
+# DIRICHLET MULTINOMIAL
+# ------------------------------------
+
+l_y_DM <- l_y_DM[(burn_in+1):N_iter]
+neg_l_y_DM <- -c(l_y_DM)
+l_y_post_DM <- log(length(l_y_DM))-max(neg_l_y_DM)-log(sum(exp(neg_l_y_DM-max(neg_l_y_DM))))
+l_y_post_DM
+
+# ------------------------------------
+# DIRICHLET PROCESS (CRP)
+# ------------------------------------
+
+l_y_DP <- l_y_DP[(burn_in+1):N_iter]
+neg_l_y_DP <- -c(l_y_DP)
+l_y_post_DP <- log(length(l_y_DP))-max(neg_l_y_DP)-log(sum(exp(neg_l_y_DP-max(neg_l_y_DP))))
+l_y_post_DP
+
+# ------------------------------------
+# PITMAN-YOR PROCESS
+# ------------------------------------
+
+l_y_PY <- l_y_PY[(burn_in+1):N_iter]
+neg_l_y_PY <- -c(l_y_PY)
+l_y_post_PY <- log(length(l_y_PY))-max(neg_l_y_PY)-log(sum(exp(neg_l_y_PY-max(neg_l_y_PY))))
+l_y_post_PY
+
+# ------------------------------------
+# GNEDIN PROCESS
+# ------------------------------------
+
+l_y_GN <- l_y_GN[(burn_in+1):N_iter]
+neg_l_y_GN <- -c(l_y_GN)
+l_y_post_GN <- log(length(l_y_GN))-max(neg_l_y_GN)-log(sum(exp(neg_l_y_GN-max(neg_l_y_GN))))
+l_y_post_GN
+
+
+l_y_GN_x <- l_y_GN_x[(burn_in+1):N_iter]
+neg_l_y_GN_x <- -c(l_y_GN_x)
+l_y_post_GN_x <- log(length(l_y_GN_x))-max(neg_l_y_GN_x)-log(sum(exp(neg_l_y_GN_x-max(neg_l_y_GN_x))))
+l_y_post_GN_x
+```
+
+As it can be noticed, the **Gnedin process performs slightly better** relative to the other priors. Moreover, the **external node attribute**, defined through **birth locations**, **yields further slight improvements in the learning process**. For instance, we obtain a positive-strong evidence in favor of the supervised GN process relative to the unsupervised representation, when studying the **Bayes factor**.
+
+```{r}
+2*(l_y_post_GN_x-l_y_post_GN)
+```
+
+As discussed in the article, accurate learning of the underlying number of groups is a fundamental goal. Hence, let us study the **quartiles of the posterior distribution for the number of non-empty groups** under the different priors and models (*see the third column in Table 1*). 
+
+```{r}
+# ------------------------------------
+# DIRICHLET MULTINOMIAL 8
+# ------------------------------------
+quantile(apply(Z_DM[,(burn_in+1):N_iter],2,max))[c(2:5)]
+
+# ------------------------------------
+# DIRICHLET PROCESS (CRP) 8
+# ------------------------------------
+quantile(apply(Z_DP[,(burn_in+1):N_iter],2,max))[c(2:5)]
+
+# ------------------------------------
+# PITMAN-YOR PROCESS 9
+# ------------------------------------
+quantile(apply(Z_PY[,(burn_in+1):N_iter],2,max))[c(2:5)]
+
+# ------------------------------------
+# GNEDIN PROCESS 7, 7
+# ------------------------------------
+quantile(apply(Z_GN[,(burn_in+1):N_iter],2,max))[c(2:5)]
+
+
+quantile(apply(Z_GN_x[,(burn_in+1):N_iter],2,max))[c(2:5)]
+```
+
+The above results seem to provide consistent evidence for the presence of either **5, 6, 7 or 8 clusters in the London gang network**. 
+
+To complete Table 1, let us obtain **point estimate** and **credible balls** for the group assignments of the different nodes. This is done by adapting the methods presented in Wade and Ghahramani (2018) and implemented in the `R` package `mcclust.ext`. To apply these strategies we also require an estimate of the **co-clustering matrix**, whose generic element `c[v,u]` encodes the relative frequency of MCMC samples in which nodes `v` and `u` are in the same cluster. Such an estimate can be obtained via the function `pr_cc()` in the source code `esbm.R` (*the `VI` distance between the estimated partition and the 95% credible bound is reported in the third column of Table 4*). 
+
+
+```{r}
+# ------------------------------------
+# DIRICHLET MULTINOMIAL
+# ------
+
+c_Z_DM <- pr_cc(Z_DM[,(burn_in+1):N_iter])
+
+# point estimate
+memb_Z_DM_VI <- minVI(c_Z_DM,method="avg",max.k=20)
+memb_Z_DM <- memb_Z_DM_VI$cl
+
+# horizontal bound of the credible ball
+credibleball(memb_Z_DM_VI$cl,t(Z_DM[,(burn_in+1):N_iter]))[[5]]
+
+# ------------------------------------
+# DIRICHLET PROCESS (CRP)
+# ------------------------------------
+
+c_Z_DP <- pr_cc(Z_DP[,(burn_in+1):N_iter])
+
+# point estimate
+memb_Z_DP_VI <- minVI(c_Z_DP,method="avg",max.k=20)
+memb_Z_DP <- memb_Z_DP_VI$cl
+
+# horizontal bound of the credible ball
+credibleball(memb_Z_DP_VI$cl,t(Z_DP[,(burn_in+1):N_iter]))[[5]]
+
+# ------------------------------------
+# PITMAN-YOR PROCESS
+# ------------------------------------
+
+c_Z_PY <- pr_cc(Z_PY[,(burn_in+1):N_iter])
+
+# point estimate
+memb_Z_PY_VI <- minVI(c_Z_PY,method="avg",max.k=20)
+memb_Z_PY <- memb_Z_PY_VI$cl
+
+# horizontal bound of the credible ball
+credibleball(memb_Z_PY_VI$cl,t(Z_PY[,(burn_in+1):N_iter]))[[5]]
+
+# ------------------------------------
+# GNEDIN PROCESS
+# ------------------------------------
+
+c_Z_GN <- pr_cc(Z_GN[,(burn_in+1):N_iter])
+
+# point estimate
+memb_Z_GN_VI <- minVI(c_Z_GN,method="avg",max.k=20)
+memb_Z_GN <- memb_Z_GN_VI$cl
+
+# horizontal bound of the credible ball
+credibleball(memb_Z_GN_VI$cl,t(Z_GN[,(burn_in+1):N_iter]))[[5]]
+
+# ------------------------------------
+
+c_Z_GN <- pr_cc(Z_GN_x[,(burn_in+1):N_iter])
+
+# point estimate
+memb_Z_GN_VI <- minVI(c_Z_GN,method="avg",max.k=20)
+memb_Z_GN <- memb_Z_GN_VI$cl
+
+# horizontal bound of the credible ball
+credibleball(memb_Z_GN_VI$cl,t(Z_GN_x[,(burn_in+1):N_iter]))[[5]]
+```
+
+Also these **results are in line with our previous discussion**. 
+
+Comparison with state-of-the-art competitors
+================
+Let us now compare the **deviances** of **ESBM (with GN prior)** and **stateâofâtheâart competitors** in the `R` libraries `igraph` and `randnet`. Such alternative strategies include the **Louvain algorithm** [Blondel et al., 2008], **spectral clustering** [Von Luxburg, 2007] and **regularized spectral clustering** [Amini et al., 2013]. 
+
+Let us now focus on computing the deviance under the **Louvain algorithm**. To implement this strategy we rely on the function `cluster_louvain()` within the `R` library `igraph`.
+
+```{r}
+# ------------------------------------
+# LOUVAIN ALGORITHM
+# ------------------------------------
+
+# transform the adjacency matrix into an igraph object
+net <- graph.adjacency(Y, mode=c("undirected"), weighted=NULL, diag=FALSE)
+
+# point estimate
+Louv <- cluster_louvain(net)$membership
+
+# estimated H
+length(table(Louv))
+
+# deviance (D)
+-log_pY_z(Y,Louv,1,1)
+```
+
+In implementing **spectral clustering**, we first need to **specify the number of groups** `sel_H`. To do this, we consider a variety of model selection criteria available in the `R` library `randnet`, and set the number of groups equal to the median of the values of `k` estimated under the different strategies. 
+
+```{r}
+set.seed(1)
+H_select <- rep(0,8)
+
+# Le and Levina (2015)
+bhmc <- BHMC.estimate(Y,K.max=20)
+H_select[1] <- bhmc$K
+
+# Wang and Bickel (2017)
+lrbic <- LRBIC(Y,Kmax=20)
+H_select[2] <- lrbic$SBM.K
+
+# Chen and Lei (2018)
+ncv <- NCV.select(Y,max.K=20)
+H_select[3] <- which.min(ncv$l2)
+H_select[4] <- which.min(ncv$dev)
+
+# Li et al. (2020)
+ecv <- ECV.block(Y,max.K=20)
+H_select[5] <- which.min(ecv$l2)
+H_select[6] <- which.min(ecv$dev)
+
+# Li et al. (2020)
+ecv.R <- ECV.Rank(Y,20,weighted=FALSE,mode="undirected")
+H_select[7] <- ecv.R$sse.rank
+H_select[8] <- ecv.R$auc.rank
+
+sel_H <- round(median(H_select))
+```
+Note that the outputs in `ncv` and `ecv` provide **empirical support in favor of SBM rather than degree-corrected SBM** in this specific application, thus further motivating the choice of **ESBM** for analyzing the *London gang network*.
+
+Once `sel_H` is available, we can obtain the deviance under **spectral clustering** as follows.
+
+```{r}
+# ------------------------------------
+# SPECTRAL CLUSTERING
+# ------------------------------------
+
+set.seed(1)
+
+# point estimate
+sc <- reg.SP(Y,K=sel_H,lap=TRUE,tau=0)$cluster
+
+# estimated H
+length(table(sc))
+
+# deviance (D)
+-log_pY_z(Y,sc,1,1)
+```
+
+All the above **deviances are considerably higher relative to those provided by ESBM with GN prior**. Since `sel_H` is lower than the one obtained under the GN prior, let us also compute the deviance for spectral clustering with the same number of clusters `k = 7` inferred under the GN process.
+
+```{r}
+# ------------------------------------
+# SPECTRAL CLUSTERING
+# ------------------------------------
+
+set.seed(1)
+
+# point estimate
+sc <- reg.SP(Y,K=8,lap=TRUE,tau=0)$cluster
+
+# deviance (D)
+-log_pY_z(Y,sc,1,1)
+```
+
+Results are still worse relative to those provided by **ESBM**, thereby confirming the **superior performance of the ESBM class also in this specific application**.
+
+Graphical representations [Figures 3, 4, 5, 7]
+================
+
+Let us first **define the colors for the different categories of the attribute** `Birth_train`. Such colors will be used for Figures 2, 3, 4 and 5. 
+
+```{r}
+mycolors <- c(brewer.pal(10,"RdBu")[c(3,9)],brewer.pal(10,"PRGn")[c(9,4)],brewer.pal(9,"YlOrBr")[3],brewer.pal(10,"RdBu")[c(2,9)])
+```
+
+The code to **reproduce Figure 3** is provided below. Color 1 (red) corresponds to birthplace 'West Africa', color 2 (blue) to birthplace 'Carribean' etc. 
+
+```{r}
+# transform the adjacency matrix into an igraph object
+net_Y <- graph.adjacency(Y, mode=c("undirected"), weighted=NULL, diag=FALSE)
+
+# compute the node betweenness to be used for the size of the nodes
+betw <- betweenness(net_Y)
+
+# node sizes are proportional to their betweenness
+# Note: for graphical purposes, we consider a monotone transformation of such a measure
+
+V(net_Y)$size <- sqrt(betw/1.5+mean(betw))*2.5
+
+# node colors indicate the birth place
+V(net_Y)$color <- adjustcolor(mycolors[c(as.factor(Birth))], alpha.f = .9)
+#V(net_Y)$shape <- c("circle")[c(as.factor(Birth_train))]
+
+
+# additional graphical settings
+V(net_Y)$frame.color <- "black"
+V(net_Y)$label <- "" 
+E(net_Y)$color <- brewer.pal(9,"Greys")[3]
+
+# node positions are obtained via circle placement
+set.seed(12)
+l <- layout_with_kk(net_Y)
+l <- norm_coords(l, ymin=-0.9, ymax=0.75, xmin=-1.4, xmax=1.4)
+
+# plot Figure 1
+plot(net_Y, rescale=F, layout=l*1.1,edge.curved=.3,edge.width=0.5)
+legend(x="topleft", legend=c("West Africa", "Carribean","Europe", "East Africa"), col=mycolors,lty=c(1,1,1),cex=1)
+save(Fig_3, file="C:/Users/rikak/Desktop/Networks/Code_notebooks/3way.jpeg")
+```
+
+To **display Figure 7** execute the code below.
+
+```{r}
+# ------------------------------------
+# LOUVAIN ALGORITHM: with respect to birth places on the left.
+# ------------------------------------
+
+# transform the adjacency matrix into an igraph object
+net <- graph.adjacency(Y, mode=c("undirected"), weighted=NULL, diag=FALSE)
+
+# point estimate
+Louv <- cluster_louvain(net)$membership
+
+# to display the block structures, re-order the rows and columns of Y, and the elements 
+#Â in RoleLocale according to the groupings estimated by the Louvain algorithm
+sel <- order(Louv)
+Louv <- Louv[sel]
+Y_Louv <- Y[sel,sel]
+RoleLocale_Louv <- Birth[sel]
+
+# plot the adjacency with the grouping structure defined by the Louvain algorithm
+row_plotLouv <- as.data.frame(as.factor(matrix(RoleLocale_Louv,V,1)))
+names(row_plotLouv) <- "RoleLocale_Louv"
+rownames(Y_Louv) <- rownames(row_plotLouv)
+names(mycolors) <- sort(unique(row_plotLouv$RoleLocale_Louv))
+
+Adj_Louv <- pheatmap(Y_Louv,color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30),cluster_cols = F, cluster_rows= F,annotation_row = row_plotLouv,annotation_names_row=F, show_rownames=F,show_colnames=F,legend=F,border_color=FALSE, annotation_legend=F, annotation_colors=list(RoleLocale_Louv = mycolors),gaps_row=c(which(diff(Louv)!=0)),gaps_col=c(which(diff(Louv)!=0)))
+
+
+# ------------------------------------
+# SPECTRAL CLUSTERING:
+# ------------------------------------
+
+set.seed(1)
+
+# point estimate
+sc <- reg.SP(Y,K=sel_H,lap=TRUE,tau=0)$cluster
+
+
+# for graphical purposed, set the order in which groups are displayed so that clusters 
+# with nodes having similar attributes are shown close to each other
+group_order <- c(1,6,2,3,4,5)
+
+# to display the block structures, re-order the rows and columns of Y, and the elements 
+#Â in RoleLocale according to the groupings estimated by spectral clustering 
+
+sel <- which(sc==1)
+for (k in 2:length(group_order)){
+sel <- c(sel,which(sc==group_order[k]))	
+}
+
+#sel
+
+sc <- sc[sel]
+Y_sc <- Y[sel,sel]
+RoleLocale_sc <- Birth[sel]
+
+# plot the adjacency with the grouping structure defined by spectral clustering
+
+# Have substituted RoleLocale_sc <- Ranking_train, V in row_plotsc with 39, Y_sc <- Y
+
+row_plotsc <- as.data.frame(as.factor(matrix(RoleLocale_sc,V,1)))
+names(row_plotsc) <- "RoleLocale_sc"
+rownames(Y_sc) <- rownames(row_plotsc)
+names(mycolors) <- sort(unique(row_plotsc$RoleLocale_sc))
+
+Adj_sp <- pheatmap(Y_sc,color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30),cluster_cols = F, cluster_rows= F,annotation_row = row_plotsc, annotation_names_row=F, show_rownames=F, show_colnames=F, legend=F, border_color=FALSE,annotation_legend=F,annotation_colors=list(RoleLocale_sc = mycolors),gaps_row=c(which(diff(sc)!=0)),gaps_col=c(which(diff(sc)!=0)))
+
+# ------------------------------------
+# ESBM WITH SUPERVISED GN PRIOR
+# ------------------------------------
+
+set.seed(1)
+
+# point estimate
+
+
+c_Z_GN <- pr_cc(Z_GN_x[,(burn_in+1):N_iter])
+memb_Z_GN_VI <- minVI(c_Z_GN,method="avg",max.k=20)
+memb_Z_GN <- memb_Z_GN_VI$cl
+print(max(memb_Z_GN))
+
+# for graphical purposed, set the order in which groups are displayed so that clusters 
+# with nodes having similar attributes are shown close to each other
+group_order <- c(1,2,3,8,4,6,5,7)
+
+# to display the block structures, re-order the rows and columns of Y, and the elements 
+# in RoleLocale according to the groupings estimated under ESBM with supervised GN prior 
+sel <- which(memb_Z_GN==1)
+sel
+
+for (k in 2:length(group_order)){
+sel <- c(sel,which(memb_Z_GN==group_order[k]))
+print(sel)
+}
+
+memb_Z_GN <- memb_Z_GN[sel]
+
+Y_esbm <- Y[sel,sel]
+RoleLocale_esbm <- Birth[sel]
+
+# plot the adjacency with the grouping structure defined by ESBM with supervised GN prior
+
+row_plotesbm <- as.data.frame(as.factor(matrix(RoleLocale_esbm,V,1)))
+names(row_plotesbm) <- "RoleLocale_esbm"
+rownames(Y_esbm) <- rownames(row_plotesbm)
+names(mycolors) <- sort(unique(row_plotesbm$RoleLocale_esbm))
+Adj_esbm <- pheatmap(Y_esbm,color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30),cluster_cols = F, cluster_rows= F,annotation_row = row_plotesbm, annotation_names_row=F,show_rownames=F, show_colnames=F, legend=F ,border_color=FALSE, annotation_legend=F,annotation_colors=list(RoleLocale_esbm = mycolors),gaps_row=c(which(diff(memb_Z_GN)!=0)),gaps_col=c(which(diff(memb_Z_GN)!=0)))
+
+# ------------------------------------
+# COMBINE THE DIFFERENT FIGURES
+# ------------------------------------
+
+g <- grid.arrange(Adj_Louv[[4]],Adj_sp[[4]],Adj_esbm[[4]],nrow=1,ncol=3,vp=viewport(width=1, height=1))
+Fig_7 <- cowplot::ggdraw(g)+ theme(plot.background =element_rect(fill=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30)[8]))
+print(Fig_7)
+
+save(Fig_7, file="C:/Users/rikak/Desktop/Networks/Code_notebooks/3way.jpeg")
+```
+
+To **reproduce Figure 5**, note that the first panel has been already obtained in Figure 8 and is available in the object `Adj_esbm`. Hence, it is sufficient to obtain the second panel via the following code.
+
+```{r}
+# ------------------------------------
+# EDGE PROBABILITY MATRIX 
+# ------------------------------------
+
+set.seed(1)
+
+# point estimate
+c_Z_GN <- pr_cc(Z_GN_x[,(burn_in+1):N_iter])
+memb_Z_GN_VI <- minVI(c_Z_GN,method="avg",max.k=20)
+memb_Z_GN <- memb_Z_GN_VI$cl
+
+# compute the matrix of estimated edge probabilities under ESBM with supervised GN prior 
+# using the function edge_est() in the source code esbm.R
+
+Y_edge_esbm <- edge_est(memb_Z_GN,Y,1,1)
+
+# for graphical purposed, set the order in which groups are displayed so that clusters 
+# with nodes having similar attributes are shown close to each other (same as for Adj_esbm)
+group_order <- c(1,2,3,8,4,6,5,7)
+
+# to display the block structures, re-order the rows and columns of Y, and the elements 
+#Â in RoleLocale according to the groupings estimated under ESBM with supervised GN prior 
+sel <- which(memb_Z_GN==1)
+for (k in 2:length(group_order)){
+sel <- c(sel,which(memb_Z_GN==group_order[k]))	
+}
+
+memb_Z_GN <- memb_Z_GN[sel]
+Y_edge_esbm <- Y_edge_esbm[sel,sel]
+RoleLocale_esbm <- Birth[sel]
+
+# plot the edge probability matrix with the grouping structure defined by ESBM under supervised GN prior
+row_plotesbm <- as.data.frame(as.factor(matrix(RoleLocale_esbm,V,1)))
+names(row_plotesbm) <- "RoleLocale_esbm"
+rownames(Y_edge_esbm) <- rownames(row_plotesbm)
+names(mycolors) <- sort(unique(row_plotesbm$RoleLocale_esbm))
+
+Adj_edge_esbm <- pheatmap(Y_edge_esbm,color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30),cluster_cols = F, cluster_rows= F,annotation_row = row_plotesbm, annotation_names_row=F, show_rownames=F,show_colnames=F, legend=F,border_color=FALSE,annotation_legend=F,annotation_colors=list(RoleLocale_esbm = mycolors),gaps_row=c(which(diff(memb_Z_GN)!=0)),gaps_col=c(which(diff(memb_Z_GN)!=0)))
+
+# ------------------------------------
+# COMBINE THE DIFFERENT FIGURES
+# ------------------------------------
+
+g <- grid.arrange(Adj_esbm[[4]],Adj_edge_esbm[[4]],nrow=1,ncol=2,vp=viewport(width=1, height=1))
+Fig_5 <- cowplot::ggdraw(g)+ theme(plot.background =element_rect(fill=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30)[8]))
+
+print(Fig_5)
+save(Fig_5, file="C:/Users/rikak/Desktop/Networks/Code_notebooks/3way.jpeg")
+```
+
+The code to **reproduce Figure 4** is provided below: **inferred network structure via the supervised GN prior**. 
+
+```{r}
+set.seed(1)
+
+# point estimate
+c_Z_GN <- pr_cc(Z_GN_x[,(burn_in+1):N_iter])
+memb_Z_GN_VI <- minVI(c_Z_GN,method="avg",max.k=20)
+memb_Z_GN <- memb_Z_GN_VI$cl
+
+# set hyperparameters of the Beta prior for the block probabilities
+a <- 1
+b <- 1
+
+# compute the matrix with estimated block probabilities
+z <- dummy(memb_Z_GN)
+
+
+H <- ncol(z)
+
+Abs_Freq <- t(z)%*%Y%*%z
+
+diag(Abs_Freq) <- diag(Abs_Freq)/2
+Tot <- t(z)%*%matrix(1,V,V)%*%z
+diag(Tot) <- (diag(Tot)-table(memb_Z_GN))/2
+Block_freq <- (a+Abs_Freq)/(a+b+Tot)
+
+# define the compositions with respect to locale affiliations and leadership role in each pie-chart
+
+t_standard <- t(table(memb_Z_GN,Birth))
+
+# to provide more direct insights, the composition with respect to role and locale in the lowerâsized 
+# pieâcharts is suitably reâweighted to account for the fact that bosses are less frequent in the 
+# network relative to affiliates
+
+t_standard[,which(apply(t_standard,2,sum)<5)] <- t_standard[,which(apply(t_standard,2,sum)<5)]/(apply(table(memb_Z_GN,Birth),2,sum))
+t_standard <- t(t_standard)
+
+# define the colors in the pie-charts
+values <- list()
+for (h in 1:H){values[[h]] <- c(t_standard[h,])}
+pie_colors <- list()
+pie_colors[[1]] <- adjustcolor(c(mycolors), alpha.f = .7)
+
+# transform the block probability matrix into an igraph object
+net_Y <- graph.adjacency(Block_freq, mode=c("undirected"), weighted=TRUE, diag=FALSE)
+
+# node sizes are proportional to cluster cardinality
+V(net_Y)$size <- (c(table(memb_Z_GN)))*4.5
+
+
+# edge sizes are proportional to the estimated block probabilities
+# Note: for graphical purposes, the block probabilities below 0.1 are not displayed
+E(net_Y)$width <- (E(net_Y)$weight*(E(net_Y)$weight>0.1))*3
+
+# additional graphical settings
+V(net_Y)$label <- NA
+V(net_Y)$frame.color <- "black"
+E(net_Y)$color <- "grey"
+
+# node positions are obtained via forceâdirected placement
+set.seed(5)
+l <- layout_in_circle(net_Y)
+l <- norm_coords(l, ymin=-0.9, ymax=0.6, xmin=-1.8, xmax=1)
+
+# plot Figure 4
+plot(net_Y,rescale=F, layout=l*1,edge.curved=0.2,vertex.shape="pie", vertex.pie=values,vertex.pie.color=pie_colors, mark.col="#f0f0f0", mark.border=NA)
+legend=(x="top", legend=c("West Africa", "Carribean","Europe", "East Africa"), col=mycolors,lty=c(1,1,1),cex=1)
+
+save(Fig_4, file="C:/Users/rikak/Desktop/Networks/Code_notebooks/Figure_4.jpeg")
+```
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
